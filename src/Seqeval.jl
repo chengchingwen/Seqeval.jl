@@ -1,102 +1,10 @@
 module Seqeval
 
-@enum LocTag begin
-    O_Tag = 0
-    B_Tag = 1
-    I_Tag = 2
-    E_Tag = 3
-    S_Tag = 4
-end
+export NETag, get_tags, f1score
 
-function toSym(t::LocTag)
-    if t == O_Tag
-        return :O
-    elseif t == B_Tag
-        return :B
-    elseif t == I_Tag
-        return :I
-    elseif t == E_Tag
-        return :E
-    elseif t == S_Tag
-        return :S
-    end
-end
+include("./tags.jl")
 
-function LocTag(s::AbstractString)
-    if s == "O"
-        return O_Tag
-    elseif s == "B"
-        return B_Tag
-    elseif s == "I"
-        return I_Tag
-    elseif s == "E"
-        return E_Tag
-    elseif s == "S"
-        return S_Tag
-    else
-        error("unknown loc tag: $s")
-    end
-end
-
-struct NEType
-    sym::Symbol
-end
-
-NEType(s::AbstractString="") = NEType(Symbol(s))
-
-Base.isempty(t::NEType) = t.sym === Symbol()
-
-Base.show(io::IO, t::NEType) = print(io, t.sym)
-
-struct NETag
-    loc::LocTag
-    type::NEType
-end
-
-const prefix_form = Ref(r"^([BIES])-([^-]+)$")
-const suffix_form = Ref(r"^([^-]+)-([BIES])$")
-
-function parse_form(label::AbstractString)
-    global prefix_form, suffix_form
-    m = match(prefix_form[], label)
-    if !isnothing(m)
-        tag, type = m.captures
-        return tag, type
-    end
-
-    m = match(suffix_form[], label)
-    if !isnothing(m)
-        type, tag = m.captures
-        return tag, type
-    end
-
-    return nothing
-end
-
-get_tags(x::Vector{<:AbstractString}) = map(NETag, x)
-get_tags(x::Vector{<:Vector{<:AbstractString}}) = map(get_tags, x)
-
-NETag() = NETag(O_Tag, NEType())
-
-function NETag(label::AbstractString)
-    if length(label) == 1
-        return NETag(LocTag(label), NEType())
-    else
-        p = parse_form(label)
-        isnothing(p) && error("unknown ne tag: $label")
-        tag, type = p
-        return NETag(LocTag(tag), NEType(type))
-    end
-end
-
-function Base.show(io::IO, t::NETag)
-    print(io, toSym(t.loc))
-    if !isempty(t.type)
-        print(io, '-', t.type.sym)
-    end
-end
-
-function isstart(prev::NETag, curr::NETag)
+function curr_isstart(prev::NETag, curr::NETag)
     (curr.loc == B_Tag || curr.loc == S_Tag) && return true
     (curr.loc == E_Tag || curr.loc == I_Tag) &&
         (prev.loc == E_Tag || prev.loc == S_Tag || prev.loc == O_Tag) && return true
@@ -104,7 +12,7 @@ function isstart(prev::NETag, curr::NETag)
     return false
 end
 
-function isend(prev::NETag, curr::NETag)
+function prev_isend(prev::NETag, curr::NETag)
     (prev.loc == E_Tag || prev.loc == S_Tag) && return true
     (prev.loc == B_Tag || prev.loc == I_Tag) &&
         (curr.loc == B_Tag || curr.loc == S_Tag || curr.loc == O_Tag) && return true
@@ -112,7 +20,7 @@ function isend(prev::NETag, curr::NETag)
     return false
 end
 
-function entity_ranges(tags::Vector{NETag})
+function entity_ranges(tags::AbstractVector{NETag})
     result = Array{Tuple{NEType, UnitRange}}(undef, 0)
     sizehint!(result, length(tags))
     entity_ranges!(result, tags)
@@ -120,7 +28,7 @@ function entity_ranges(tags::Vector{NETag})
     return result
 end
 
-function entity_ranges!(result, tags::Vector{NETag})
+function entity_ranges!(result, tags::AbstractVector{NETag})
     len = length(tags)
 
     @assert len > 0
@@ -129,72 +37,91 @@ function entity_ranges!(result, tags::Vector{NETag})
     @inbounds while i <= len
         tag = tags[i]
 
-        isend(prev, tag) && push!(result, (prev.type, base:i-1))
-        isstart(prev, tag) && (base = i)
+        prev_isend(prev, tag) && push!(result, (prev.type, base:i-1))
+        curr_isstart(prev, tag) && (base = i)
 
         prev = tag
         i += 1
     end
-    isend(prev, NETag()) && push!(result, (prev.type, base:i-1))
+    prev_isend(prev, nulltag) && push!(result, (prev.type, base:i-1))
     return result
 end
 
-function compute_correct(types, p_entity, gt_entity)
-    len = length(types)
-    p_sum = zeros(Int32, len)
-    gt_sum = zeros(Int32, len)
-    correct_sum = zeros(Int32, len)
-    @inbounds for (i, type) in enumerate(types)
-        p_has = haskey(p_entity, type)
-        gt_has = haskey(gt_entity, type)
-
-        p_has && (p_sum[i] = length(p_entity[type]))
-        gt_has && (gt_sum[i] = length(gt_entity[type]))
-        p_has && gt_has && (correct_sum[i] = length(p_entity[type] ∩ gt_entity[type]))
-    end
-    return (type=types, correct=correct_sum, p=p_sum, gt=gt_sum)
+function plus1!(d::Dict, key)
+    d[key] = get(d, key, 0) + 1
 end
 
-function entity_stat(p, gt)
-    p_entity = Dict{NEType, Set{Tuple{Int, UnitRange}}}()
-    gt_entity = Dict{NEType, Set{Tuple{Int, UnitRange}}}()
-    types = Set{NEType}()
-    return entity_stat!(types, p_entity, gt_entity, p, gt)
+function compute_correct(p::AbstractVector{<:AbstractVector{NETag}}, gt::AbstractVector{<:AbstractVector{NETag}})
+    result = SeqEval()
+    for (pi, gti) in zip(p, gt)
+        compute_correct!(result, pi, gti)
+    end
+    return result
 end
 
-function entity_stat!(types, p_entity, gt_entity, p::Vector{Vector{NETag}}, gt::Vector{Vector{NETag}})
-    for (i, (pi, gti)) in enumerate(zip(p, gt))
-        entity_stat!(types, p_entity, gt_entity, pi, gti, i)
-    end
-    return (types, p_entity, gt_entity)
-end
+compute_correct(p::AbstractVector{NETag}, gt::AbstractVector{NETag}) = compute_correct!(SeqEval(), p, gt)
+function compute_correct!(result, p::AbstractVector{NETag}, gt::AbstractVector{NETag})
+    plen = length(p)
+    gtlen = length(gt)
+    maxlen = max(plen, gtlen)
 
-function entity_stat!(types, p_entity, gt_entity, p::Vector{NETag}, gt::Vector{NETag}, i = 1)
-    for (type, rang) in entity_ranges(p)
-        !haskey(p_entity, type) && (p_entity[type] = Set{UnitRange}())
-        push!(p_entity[type], (i, rang))
-        push!(types, type)
-    end
-    for (type, rang) in entity_ranges(gt)
-        !haskey(gt_entity, type) && (gt_entity[type] = Set{UnitRange}())
-        push!(gt_entity[type], (i, rang))
-        push!(types, type)
-    end
-    return (types, p_entity, gt_entity)
-end
+    @assert plen > 0 && gtlen > 0
+    p_prev = first(p)
+    gt_prev = first(gt)
+    pbase = gtbase = 1
+    i = 2
+    c = p_prev == gt_prev
+    @inbounds while i <= maxlen
+        ptag = i > plen ? nulltag : p[i]
+        gttag = i > gtlen ? nulltag : gt[i]
 
-function extract_correct(p, gt)
-    types, p_entity, gt_entity = entity_stat(p, gt)
-    return compute_correct(types, p_entity, gt_entity)
+        ptag == gttag && (c += 1)
+
+        p_isend = prev_isend(p_prev, ptag)
+        gt_isend = prev_isend(gt_prev, gttag)
+
+        p_isstart = curr_isstart(p_prev, ptag)
+        gt_isstart = curr_isstart(gt_prev, gttag)
+
+        p_isend && plus1!(result.p, p_prev.type)
+        gt_isend && plus1!(result.gt, gt_prev.type)
+
+        if p_isend && gt_isend && pbase == gtbase && p_prev.type == gt_prev.type
+            plus1!(result.correct, gt_prev.type)
+        end
+
+        p_isstart && (pbase = i)
+        gt_isstart && (gtbase =  i)
+
+        p_prev = ptag
+        gt_prev = gttag
+        i += 1
+    end
+
+    p_isend = prev_isend(p_prev, nulltag)
+    gt_isend = prev_isend(gt_prev, nulltag)
+
+    p_isend && plus1!(result.p, p_prev.type)
+    gt_isend && plus1!(result.gt, gt_prev.type)
+
+    if p_isend && gt_isend && pbase == gtbase && p_prev.type == gt_prev.type
+        plus1!(result.correct, gt_prev.type)
+    end
+
+    result.count[] += c
+    result.total[] += maxlen
+
+    return result
 end
 
 function micro_average(result, β)
-    p = sum(result.p)
-    gt = sum(result.gt)
-    correct = sum(result.correct)
+    p = sum(values(result.p))
+    gt = sum(values(result.gt))
+    correct = sum(values(result.correct))
 
     precision = iszero(p) ? 0 : correct / p
     recall = iszero(gt) ? 0 : correct / gt
+    acc = result.count[] / result.total[]
 
     if isinf(β) && β > 0
         f1 = recall
@@ -202,20 +129,37 @@ function micro_average(result, β)
         denominator = iszero(precision) && iszero(recall) ? one(recall) : recall + precision * β^2
         f1 = (1 + β^2) * recall * precision / denominator
     end
-    return precision, recall, f1, gt
+    return (accuracy = acc, precision = precision, recall = recall, f1score = f1)
 end
 
-
 function precision_recall_f1score_support(p, gt; β = true)
-    result = extract_correct(p, gt)
+    result = compute_correct(p, gt)
     micro_average(result, β)
 end
 
-precision(p, gt) = precision_recall_f1score_support(p, gt)[1]
-recall(p, gt) = precision_recall_f1score_support(p, gt)[2]
-f1(p, gt) = precision_recall_f1score_support(p, gt)[3]
+accuracy(p, gt) = precision_recall_f1score_support(p, gt).accuracy
+precision(p, gt) = precision_recall_f1score_support(p, gt).precision
+recall(p, gt) = precision_recall_f1score_support(p, gt).recall
+f1score(p, gt; β = true) = precision_recall_f1score_support(p, gt; β).f1score
 
-                  
+struct SeqEval
+    correct::Dict{NEType,Int}
+    p::Dict{NEType, Int}
+    gt::Dict{NEType, Int}
+    count::Ref{Int}
+    total::Ref{Int}
+end
+
+SeqEval() = SeqEval(Dict{NEType,Int}(), Dict{NEType, Int}(), Dict{NEType, Int}(), Ref(0), Ref(0))
+
+Base.push!(s::SeqEval, p, gt) = compute_correct!(s, p, gt)
+
+precision_recall_f1score_support(s::SeqEval; β = true) = micro_average(s, β)
+accuracy(s::SeqEval) = precision_recall_f1score_support(s).accuracy
+precision(s::SeqEval) = precision_recall_f1score_support(s).precision
+recall(s::SeqEval) = precision_recall_f1score_support(s).recall
+f1score(s::SeqEval; β = true) = precision_recall_f1score_support(s; β).f1score
+
 # y_true = [["O", "O", "O", "B-MISC", "I-MISC", "I-MISC", "O"], ["B-PER", "I-PER", "O"]]
 # y_pred = [["O", "O", "B-MISC", "I-MISC", "I-MISC", "I-MISC", "O"], ["B-PER", "I-PER", "O"]]
 # y_true = [["O", "O", "B-MISC", "I-MISC", "B-MISC", "O", "O"], ["B-PER", "I-PER", "O"]]
