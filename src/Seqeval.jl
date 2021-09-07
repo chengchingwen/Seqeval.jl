@@ -1,6 +1,6 @@
 module Seqeval
 
-export NETag, get_tags, f1score
+export NETag, get_tags, f1score, SeqEval
 
 include("./tags.jl")
 
@@ -51,13 +51,14 @@ function plus1!(d::Dict, key)
     d[key] = get(d, key, 0) + 1
 end
 
-function compute_correct(p::AbstractVector{<:AbstractVector{NETag}}, gt::AbstractVector{<:AbstractVector{NETag}})
-    result = SeqEval()
+function compute_correct!(result, p::AbstractVector{<:AbstractVector{NETag}}, gt::AbstractVector{<:AbstractVector{NETag}})
     for (pi, gti) in zip(p, gt)
         compute_correct!(result, pi, gti)
     end
     return result
 end
+
+compute_correct(p::AbstractVector{<:AbstractVector{NETag}}, gt::AbstractVector{<:AbstractVector{NETag}}) = compute_correct!(SeqEval(), p, gt)
 
 compute_correct(p::AbstractVector{NETag}, gt::AbstractVector{NETag}) = compute_correct!(SeqEval(), p, gt)
 function compute_correct!(result, p::AbstractVector{NETag}, gt::AbstractVector{NETag})
